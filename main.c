@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////
-// weller_driver_v08.c
+// weller_driver_v09.c
 ////////////////////////////////////////////////////
 // Copyright 2015 - 2017 Jaakko Kairus
 // jaakko@kair.us
@@ -13,7 +13,7 @@
 // http://kair.us/projects/weller/
 //
 // Compiled with CCS compiler version 5.054
-// Total compiled length 5107 bytes
+// Total compiled length 5298 bytes
 ///////////////////////////////////////////////////
 // Version history
 // v0.1 30.5.2015
@@ -57,9 +57,20 @@
 // v0.8	5.2.2017
 //		Fixed time delays to use the 832 us interrupt period. Better button debounce.
 //		Fixed tip detection when plugging in iron which is on stand (reed closed)
+// v0.9 28.7.2017
+//		Added check for all parameters which are stored to EEPROM. If any of parameters
+//		are out of valid range, all of them are set to default values. This fixes problem
+//		when using MPLAB IPE to program the PIC, and EEPROM is not erased or programmed.
+//		Added clearing of display anodes before parameter save to avoid bright flash of
+//		currently active segments.
+// v0.901 28.7.2017
+//		Fixed setback and poweroff incase delay set to 0 minutes. Added some fixes to
+//		tip type recognition at startup to prevent errorneous WMRT detection. Added
+//		workaround to allow returning from setback for five seconds even if setback
+//		delay set to zero. Allows e.g. to put the iron to standby from setback with two
+//		consecutive button presses.
 
-
-#define FW_VERSION 800
+#define FW_VERSION 901
 #define CC_DISPLAY	// Actually we use common anode display but as we mux
 					// segments and not digits we must use inverted patterns!
 
@@ -76,10 +87,37 @@
 #use FAST_IO(c)
 #use FAST_IO(e)
 
+// Some defaut parameter values to EEPROM. Not necessary since all EEPROM values are verified to be
+// in range at startup.
+// #rom 0xf000 = {0x7c,0x01,0xfa,0x00,0x05,0x00,0x1e,0x00}
+// #rom 0xf008 = {0x00,0x00,0x00,0x08,0x05,0x00,0x00,0x00}
+// #rom 0xf010 = {0x32}
+
 #define REED_PULLUP PIN_B3
 #define HEATER_1 PIN_B4
 #define HEATER_2 PIN_B5
 
+// Assign some 'factory default' values to use when run for the first time
+// These are also used if any of the parameters stored in eeprom are outside
+// of valid range
+#define DEFAULT_SETPOINT 380
+#define DEFAULT_SETBACK 250
+#define DEFAULT_SETBACK_DELAY 5
+#define DEFAULT_POWEROFF_DELAY 30
+#define DEFAULT_TEMPERATURE_OFFSET 0
+#define DEFAULT_REFERENCE 2048
+#define DEFAULT_STEPSIZE 5
+#define DEFAULT_TEMPERATURE_UNIT DISP_C
+#define DEFAULT_POORMODE 0
+#define DEFAULT_MAINSFREQUENCY 50
+
+// Assign sane / safe limits to the above parameters
+#define MAX_SETPOINT 450				// these are also used
+#define MIN_SETPOINT 100				// for setback range
+#define MAX_SETBACK_DELAY 30
+#define MAX_POWEROFF_DELAY 120
+#define MAX_TEMPERATURE_OFFSET 40
+#define MAX_REFERENCE_TOLERANCE 103		// max. tolerance is 5% of 2.048
 
 // Message examples
 byte const  cold[5] = {_C,_O,_L,_D,_SPACE}; //  CoLd
@@ -179,7 +217,6 @@ typedef enum {
 		DISP_NUM,
 		DISP_REF
 } DISP_MODES;
-DISP_MODES temperature_unit = DISP_C;
 
 // D-type thermocouple 0..500 C difference, op amp gain 241, reference 2.048V
 unsigned int16 ROM tc_lookup[51] = {0,756,1535,2352,3200,4072,4967,5900,6848,7828,
@@ -208,12 +245,21 @@ signed int16 right_buf=0;
 signed int16 left_buf=0;
 signed int16 kty_buf=25;
 signed int16 new_temp=0;
-signed int16 setback_delay=5;
-signed int16 setback=250;
-signed int16 setpoint=380;
+
+// Saveable parameters. These will be downloaded from EEPROM and set to default
+// if any of them are out of range, therefore no need to give initial values.
+signed int16 setpoint;
+signed int16 setback;
+signed int16 setback_delay;
+signed int16 poweroff_delay;
+signed int16 temperature_offset;
+signed int16 reference;
+signed int16 stepsize;
+DISP_MODES temperature_unit;
+unsigned int1 poorMode;
+unsigned int8 mainsFrequency;
+
 signed int16 normal_setpoint=0;
-signed int16 temperature_offset=0;
-signed int16 poweroff_delay=30;
 int8 i=0;
 int16 j=0;
 unsigned int16 buttimer=0;
@@ -221,15 +267,11 @@ unsigned int8 releasetimer=0;
 unsigned int8 heaterStatus=0xff;
 unsigned int8 heater2Status=0xff;
 unsigned int32 milliseconds=0;
-unsigned int16 idleminutes=0;
+unsigned int8 idleminutes=0;
 unsigned int16 setpointdelay=1000;
 signed int16 filteredtemp=0;
 unsigned int8 savesettings=0;
-signed int16 stepsize=5;
-signed int16 reference=2048;
 unsigned int8 mainsCycles=0;
-unsigned int1 poorMode=0;
-unsigned int8 mainsFrequency=50;
 
 void saveParms();															// saves current parameters to EEPROM
 void menuMachine();															// updates menu state based on encoder event
@@ -328,12 +370,19 @@ void timer2isr(void) {
 	if (milliseconds==72191)	// 72115*832 us = 60 s. But 72191 is faster to compare
 	{
 		milliseconds=0;
-		idleminutes++;
-		if (idleminutes == setback_delay && setback_delay != 31)
-			state = ST_SETBACK;
-		if (idleminutes == poweroff_delay && poweroff_delay != 130)
-			state = ST_STANDBY;		
+		if (idleminutes < 255)	// don't let idleminutes overflow
+			idleminutes++;
+//		if (idleminutes == setback_delay && setback_delay != 31)
+//			state = ST_SETBACK;
+//		if (idleminutes == poweroff_delay && poweroff_delay != 130)
+//			state = ST_STANDBY;		
 	}
+
+	if (milliseconds == 1 && idleminutes == setback_delay && setback_delay != 31 && state == ST_MAIN)
+		state = ST_SETBACK;
+	if (milliseconds == 1 && idleminutes == poweroff_delay && poweroff_delay != 130 && (state == ST_MAIN || state == ST_SETBACK))
+		state = ST_STANDBY;		
+
 
 	if (setpointdelay>0)
 		setpointdelay--;
@@ -454,15 +503,15 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					break;
 				case EVT_LEFT:
 					setpoint-=stepsize;
-					if (setpoint < 100)
-						setpoint = 100;
+					if (setpoint < MIN_SETPOINT)
+						setpoint = MIN_SETPOINT;
 					normal_setpoint = setpoint;
 					setpointdelay=1202;
 					break;
 				case EVT_RIGHT:
 					setpoint+=stepsize;
-					if (setpoint > 450)
-						setpoint = 450;
+					if (setpoint > MAX_SETPOINT)
+						setpoint = MAX_SETPOINT;
 					normal_setpoint = setpoint;
 					setpointdelay=1202;
 					break;
@@ -499,6 +548,12 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					setpoint = normal_setpoint;
 					milliseconds = 0;
 					idleminutes = 0;
+					if (setback_delay == 0)			// workaround to briefly activate ST_MAIN if setback is zero
+						milliseconds = 4294961286;	// this number will overflow in 5 seconds
+					break;
+				case EVT_LONG_PRESS:
+					state = ST_MENU_MAIN;
+					setpoint = normal_setpoint;
 					break;
 			}
 			break;	
@@ -538,11 +593,11 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					state = ST_MENU_SETBACK;
 					break;
 				case EVT_LEFT:
-					if(setback>100)
+					if(setback > MIN_SETPOINT)
 						setback-=10;
 					break;
 				case EVT_RIGHT:
-					if(setback<450)
+					if(setback < MAX_SETPOINT)
 						setback+=10;
 					break;
 			}
@@ -573,7 +628,7 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 						setback_delay--;
 					break;
 				case EVT_RIGHT:
-					if(setback_delay<31)
+					if(setback_delay < MAX_SETBACK_DELAY+1)
 						setback_delay++;
 				break;
 			}
@@ -606,8 +661,8 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					break;
 				case EVT_RIGHT:
 					poweroff_delay+=10;
-					if (poweroff_delay>120)
-						poweroff_delay=130;
+					if (poweroff_delay > MAX_POWEROFF_DELAY)
+						poweroff_delay = MAX_POWEROFF_DELAY+10;
 					break;
 			}
 			break;
@@ -633,11 +688,11 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					state = ST_MENU_OFFSET;
 					break;
 				case EVT_LEFT:
-					if(temperature_offset>-40)
+					if(temperature_offset > -(MAX_TEMPERATURE_OFFSET))
 						temperature_offset--;
 					break;
 				case EVT_RIGHT:
-					if(temperature_offset<40)
+					if(temperature_offset < MAX_TEMPERATURE_OFFSET)
 						temperature_offset++;
 					break;
 			}
@@ -695,10 +750,10 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					break;
 				case EVT_LEFT:
 				case EVT_RIGHT:
-					if(stepsize == 5)
+					if(stepsize == DEFAULT_STEPSIZE)
 						stepsize = 1;
 					else
-						stepsize = 5; 
+						stepsize = DEFAULT_STEPSIZE; 
 					break;
 			}
 			break;
@@ -774,11 +829,11 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					state = ST_MENU_REFERENCE;
 					break;
 				case EVT_LEFT:
-					if(reference>1945)
+					if(reference > 2048 - MAX_REFERENCE_TOLERANCE)
 						reference--;
 					break;
 				case EVT_RIGHT:
-					if(reference<2151)
+					if(reference < 2048 + MAX_REFERENCE_TOLERANCE)
 						reference++;
 					break;
 			}
@@ -1124,6 +1179,7 @@ void saveParms()
 {
 	output_low(HEATER_1);	// Turn heaters off before saving parameters - interrupts are disabled
 	output_low(HEATER_2);	// during EEPROM write and we don't want something bad to happen if write jams
+	output_a(_SPACE); 		// clear anodes to eliminate brigt flash of currently active segments
 	write_int16_eeprom(0, setpoint);
 	write_int16_eeprom(2, setback);
 	write_int16_eeprom(4, setback_delay);
@@ -1152,6 +1208,7 @@ void main()
 	unsigned int8 kty_filt_cycles=0;
 	unsigned int1 calculateTemp=0;
 	unsigned int1 checkTip=0;
+	unsigned int8 paramsOutOfRange=0;
 	setup_timer_2(T2_DIV_BY_16,208,2); // set timer2 to 832 µs (prescaler 16 and postscaler 2, period 208)
 	enable_interrupts(INT_TIMER2);
 	enable_interrupts(GLOBAL);
@@ -1175,8 +1232,6 @@ void main()
 
 	setup_adc(ADC_CLOCK_DIV_32);	// Gives 1µs conversion clock cycle time (fastest recommended)
 
-	if (read_eeprom(0)==0xFF && read_eeprom(1)==0xFF)	// Reprogramming has erased EEPROM or first time run
-		saveParms();
 	setpoint = read_int16_eeprom(0);
 	setback = read_int16_eeprom(2);			// must use even addresses because one int16 takes two bytes
 	setback_delay = read_int16_eeprom(4);
@@ -1188,14 +1243,44 @@ void main()
 	poorMode = read_eeprom(15);
 	mainsFrequency = read_eeprom(16);
 
-	if (setpoint > 450)		// Ensure safe temperature setpoints in case of corrupt EEPROM data
-		setpoint = 380;
-	if (setback > 450)
-		setback = 250;
+	if (setpoint < MIN_SETPOINT || setpoint > MAX_SETPOINT)		// Ensure safe temperature setpoints in case of corrupt EEPROM data
+		paramsOutOfRange=TRUE;
+	if (setback < MIN_SETPOINT || setback > MAX_SETPOINT)
+		paramsOutOfRange=TRUE;
+	if (setback_delay < 0 || setback_delay > MAX_SETBACK_DELAY+1)
+		paramsOutOfRange=TRUE;
+	if (poweroff_delay < 0 || poweroff_delay > MAX_POWEROFF_DELAY+10)
+		paramsOutOfRange=TRUE;
+	if (temperature_offset < -(MAX_TEMPERATURE_OFFSET) || temperature_offset > MAX_TEMPERATURE_OFFSET)
+		paramsOutOfRange=TRUE;
+	if (reference < 2048 - MAX_REFERENCE_TOLERANCE || reference > 2048 + MAX_REFERENCE_TOLERANCE)
+		paramsOutOfRange=TRUE;
+	if (stepsize != 1 && stepsize != 5)
+		paramsOutOfRange=TRUE;
+	if (temperature_unit != DISP_C && temperature_unit != DISP_F)
+		paramsOutOfRange=TRUE;
+	if (mainsFrequency != 50 && mainsFrequency != 60)
+		paramsOutOfRange=TRUE;
+	
+	if (paramsOutOfRange) {
+		setpoint = DEFAULT_SETPOINT;
+		setback = DEFAULT_SETBACK;
+		setback_delay = DEFAULT_SETBACK_DELAY;
+		poweroff_delay = DEFAULT_POWEROFF_DELAY;
+		temperature_offset = DEFAULT_TEMPERATURE_OFFSET;
+		reference = DEFAULT_REFERENCE;
+		stepsize = DEFAULT_STEPSIZE;
+		temperature_unit = DEFAULT_TEMPERATURE_UNIT;
+		poorMode = DEFAULT_POORMODE;
+		mainsFrequency = DEFAULT_MAINSFREQUENCY;
+	}	
 
 	normal_setpoint = setpoint;
 
+	recognizeTypeInStand();
+	recognizeTypeInStand();
 	delay_ms(10);	// let auto-zero op-amps stabilize before tip type recognition
+	tiptype = TYPE_WMRP;
 	recognizeTypeInStand();
 
 	/* Infinite loop */
