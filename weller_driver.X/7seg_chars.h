@@ -12,8 +12,8 @@
 #define _CELSIUS 0x39
 #define _DEGREE 0x04
 #define _ADDPOINT |0x80
-#define _ADD_HEATER_STATUS |(~heaterStatus)
-#define _ADD_HEATER_2_STATUS |(~heater2Status)
+#define _ADD_HEATER_STATUS |(~HeaterStatusR)
+#define _ADD_HEATER_2_STATUS |(~HeaterStatusL)
 #define _0P 0xbf
 #define _0 0x3f
 #define _1 0x06
@@ -57,8 +57,8 @@
 #define _CELSIUS 0xc6
 #define _DEGREE 0xfb
 #define _ADDPOINT &0x7f
-#define _ADD_HEATER_STATUS &heaterStatus
-#define _ADD_HEATER_2_STATUS &heater2Status
+#define _ADD_HEATER_STATUS &HeaterStatusR
+#define _ADD_HEATER_2_STATUS &HeaterStatusL
 #define _0P 0x40
 #define _0 0xC0
 #define _1 0xf9
