@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////
-// weller_driver_v09.c
+// weller_driver_v0910.c
 ////////////////////////////////////////////////////
-// Copyright 2015 - 2017 Jaakko Kairus
+// Copyright 2015 - 2018 Jaakko Kairus
 // jaakko@kair.us
 //
 // You may freely use and modify this software for personal use.
@@ -12,8 +12,8 @@
 // For more information about this project see project web page at
 // http://kair.us/projects/weller/
 //
-// Compiled with CCS compiler version 5.054
-// Total compiled length 5298 bytes
+// Compiled with CCS compiler version 5.081
+// Total compiled length 5937 bytes
 ///////////////////////////////////////////////////
 // Version history
 // v0.1 30.5.2015
@@ -69,11 +69,48 @@
 //		workaround to allow returning from setback for five seconds even if setback
 //		delay set to zero. Allows e.g. to put the iron to standby from setback with two
 //		consecutive button presses.
+// v0.902 27.8.2018
+//		Added compile option for common cathode display. WELLER_CC_DISPLAY.
+//		Length 4888 words, 5307 w/o #opt compress
+// v0.903 15.9.2018
+//		Added diag menu items to show PWM duty cycle values for both heaters. Added diag
+//		menu setting for 'idle duty cycle', which allows station to go to setback or power
+//		off based on average power to tip. Added diag menu setting to limit maximum
+//		heater duty cycle. This can be used to limit max power, possibly lenghtening tip
+//		life.
+// v0.910 17.10.2018
+//		Revised thermocouple lookup table based on actual measurements with Weller K1101
+//		calibration tip. Degree sign now shows reed status, it is dimmed when reed is closed.
+//		Added possibility to turn idle duty cycle to 'off'.
 
-#define FW_VERSION 901
+#define FW_VERSION 910
+// #define WELLER_CC_DISPLAY	// Uncomment this line if you use common cathode display
+
+#ifdef WELLER_CC_DISPLAY
+#define SEGMENT_A output_c(0b00000001);
+#define SEGMENT_B output_c(0b00000010);
+#define SEGMENT_C output_c(0b00000100);
+#define SEGMENT_D output_c(0b00001000);
+#define SEGMENT_E output_c(0b00010000);
+#define SEGMENT_F output_c(0b00100000);
+#define SEGMENT_G output_c(0b01000000);
+#define SEGMENT_DP output_c(0b10000000);
+#define SEGMENT_NONE output_c(0b00000000);
+#else
+#define SEGMENT_A output_c(0b11111110);
+#define SEGMENT_B output_c(0b11111101);
+#define SEGMENT_C output_c(0b11111011);
+#define SEGMENT_D output_c(0b11110111);
+#define SEGMENT_E output_c(0b11101111);
+#define SEGMENT_F output_c(0b11011111);
+#define SEGMENT_G output_c(0b10111111);
+#define SEGMENT_DP output_c(0b01111111);
+#define SEGMENT_NONE output_c(0b11111111);
 #define CC_DISPLAY	// Actually we use common anode display but as we mux
 					// segments and not digits we must use inverted patterns!
+#endif
 
+//#opt compress
 #include <16F1788.h>
 #device ADC=12;
 #include "7seg_chars.h"
@@ -110,6 +147,8 @@
 #define DEFAULT_TEMPERATURE_UNIT DISP_C
 #define DEFAULT_POORMODE 0
 #define DEFAULT_MAINSFREQUENCY 50
+#define DEFAULT_MAXDUTY 5				// 58% duty cycle on 50 Hz, 50% on 60 Hz
+#define DEFAULT_IDLEDUTY 0				// Idle detection from duty cycle off as default
 
 // Assign sane / safe limits to the above parameters
 #define MAX_SETPOINT 450				// these are also used
@@ -118,6 +157,9 @@
 #define MAX_POWEROFF_DELAY 120
 #define MAX_TEMPERATURE_OFFSET 40
 #define MAX_REFERENCE_TOLERANCE 103		// max. tolerance is 5% of 2.048
+#define MAX_MAXDUTY 9
+#define MIN_MAXDUTY 3					// This means actually max setting, which is 75% for 50 Hz and 70% for 60 Hz
+#define MAX_IDLEDUTY 75
 
 // Message examples
 byte const  cold[5] = {_C,_O,_L,_D,_SPACE}; //  CoLd
@@ -141,6 +183,10 @@ byte const  open[5] = {_O,_P,_E,_N,_SPACE}; //  oPEn
 byte const  clos[5] = {_C,_L,_O,_S,_SPACE}; //  CLoS
 byte const  tc_1[5] = {_T,_C,_SPACE,_1,_SPACE}; //  tC 1
 byte const  tc_2[5] = {_T,_C,_SPACE,_2,_SPACE}; //  tC 2
+byte const  pwm1[5] = {_D,_C,_SPACE,_1,_SPACE}; //  dC 1
+byte const  pwm2[5] = {_D,_C,_SPACE,_2,_SPACE}; //  dC 2
+byte const  idle[5] = {_I,_D,_L,_E,_SPACE}; //  idLE
+byte const  dcli[5] = {_D,_C,_L,_I,_SPACE}; //  dCLi
 byte const  poor[5] = {_P,_O,_O,_R,_SPACE}; //  Poor
 byte const    on[5] = {_SPACE,_SPACE,_O,_N,_SPACE}; // on
 byte const  freq[5] = {_F,_R,_E,_Q,_SPACE}; //	FrEQ
@@ -179,6 +225,14 @@ typedef enum {
         ST_SHOW_TC_1_READING,
         ST_MENU_TC_2_READING,
         ST_SHOW_TC_2_READING,
+        ST_MENU_PWM_1_READING,
+        ST_SHOW_PWM_1_READING,
+        ST_MENU_PWM_2_READING,
+        ST_SHOW_PWM_2_READING,
+        ST_MENU_IDLE_DC,
+        ST_ADJ_IDLE_DC,
+        ST_MENU_DC_LIMIT,
+        ST_ADJ_DC_LIMIT,
         ST_MENU_POOR,
         ST_ADJ_POOR,
 		ST_MENU_FREQUENCY,
@@ -218,13 +272,22 @@ typedef enum {
 		DISP_REF
 } DISP_MODES;
 
-// D-type thermocouple 0..500 C difference, op amp gain 241, reference 2.048V
-unsigned int16 ROM tc_lookup[51] = {0,756,1535,2352,3200,4072,4967,5900,6848,7828,
-									8830,9856,10905,11984,13080,14190,15331,16481,17660,18856,
-									20067,21293,22542,23807,25087,26375,27686,29005,30347,31696,
-									33054,34426,35815,37210,38622,40041,41467,42902,44352,45809,
-									47267,48740,50221,51709,53197,54701,56205,57717,59236,60763,
-									62290};
+// Custom thermocouple 0..500 C difference, op amp gain 241, reference 2.048V
+// after second calibration round
+unsigned int16 ROM tc_lookup[51] = {0,1003,2028,3073,4138,5223,6327,7449,8588,9743,
+									10915,12101,13302,14517,15745,16986,18238,19501,20774,22057,
+									23349,24649,25956,27271,28591,29916,31247,32581,33918,35258,
+									36600,37943,39286,40629,41971,43311,44649,45984,47315,48642,
+									49963,51279,52588,53889,55183,56468,57743,59008,60263,61506,
+									62736};
+
+// Here is table after first calibration round
+//unsigned int16 ROM tc_lookup[51] = {0,944,1912,2903,3917,4954,6011,7089,8188,9305,
+//									10441,11595,12767,13954,15158,16376,17609,18855,20115,21387,
+//									22670,23964,25268,26582,27904,29235,30572,31917,33267,34623,
+//									35983,37347,38714,40084,41455,42827,44200,45572,46943,48313,
+//									49679,51043,52403,53758,55108,56452,57789,59119,60441,61753,
+//									63057};
 
 // KTY82/110 temperature sensor connected between GND and 1k pullup to reference. -50...+150 in 10 degree steps
 // ADC REF = 2.048V
@@ -258,6 +321,8 @@ signed int16 stepsize;
 DISP_MODES temperature_unit;
 unsigned int1 poorMode;
 unsigned int8 mainsFrequency;
+unsigned int8 maxDuty;
+unsigned int8 idleDuty;
 
 signed int16 normal_setpoint=0;
 int8 i=0;
@@ -272,19 +337,28 @@ unsigned int16 setpointdelay=1000;
 signed int16 filteredtemp=0;
 unsigned int8 savesettings=0;
 unsigned int8 mainsCycles=0;
+unsigned int16 heaterCycles=0;
+unsigned int16 heater2Cycles=0;
+unsigned int8 heaterDuty=0;
+unsigned int8 heater2Duty=0;
+unsigned int16 dutyCounter=0;
+unsigned int1 degreeDimmer=0;
+unsigned int8 digit4Temp=_SPACE;
 
-void saveParms();															// saves current parameters to EEPROM
-void menuMachine();															// updates menu state based on encoder event
-void updateDisplay();														// updates display memory based on current menu state
 void show_7seg_num(DISP_MODES mode, signed int16 num);						// converts integers to 7 segment numbers
 void readAdc(int16* adc_r, unsigned int8 channel);							// reads specified ADC input 16 times to get a virtual 16 bit reading
 void tc_lookup_32bit(unsigned int32* adc_sum, signed int16* temperature);	// converts thermocouple voltage to temperature
 void kty_lookup_16bit(unsigned int16* adc_sum, signed int16* temperature);	// converts cold junction compensation sensor voltage to temperature
+void menuMachine();															// updates menu state based on encoder event
+void updateDisplay();														// updates display memory based on current menu state
 void recognizeTypeInStand()	;												// recognizes tip type even when in stand
+void saveParms();															// saves current parameters to EEPROM
 
 #int_timer2			// timer2 is set to 832 us
 void timer2isr(void) {
 	// output_a(_8); // for testing interrupt length, currently 20-25 us when menuMachine call moved to interrupt
+	
+	// Update mainsCycles. It is used to trigger next temperature readout, somewhat synced to AC phase
 	mainsCycles++;
 	if (mainsFrequency==50) {
 		if (mainsCycles>=24)	// 50 Hz
@@ -295,39 +369,49 @@ void timer2isr(void) {
 			mainsCycles=0;
 	}
 	
+	// Dim decimal point if reed closed, i.e. iron on stand
+	if (degreeDimmer == 1 && reed_status == REED_CLOSED)
+		digit4Temp = _SPACE;
+	else
+		digit4Temp = DISPLAY[4];
+	
+	// Seven segment display multiplexing
 	output_a(_SPACE); // clear anodes
 	switch(CURRENT_SEG) {
-		case 0:	output_c(0b11111110);
-				output_a(((DISPLAY[4]&0x01)<<7)|((DISPLAY[3]&0x01)<<6)|((DISPLAY[2]&0x01)<<5)|((DISPLAY[1]&0x01)<<4)|((DISPLAY[0]&0x01)<<3));
+		case 0:	SEGMENT_A
+				output_a(((digit4Temp&0x01)<<7)|((DISPLAY[3]&0x01)<<6)|((DISPLAY[2]&0x01)<<5)|((DISPLAY[1]&0x01)<<4)|((DISPLAY[0]&0x01)<<3));
 				break;
-		case 1:	output_c(0b11111101);
-				output_a(((DISPLAY[4]&0x02)<<6)|((DISPLAY[3]&0x02)<<5)|((DISPLAY[2]&0x02)<<4)|((DISPLAY[1]&0x02)<<3)|((DISPLAY[0]&0x02)<<2));
+		case 1:	SEGMENT_B
+				output_a(((digit4Temp&0x02)<<6)|((DISPLAY[3]&0x02)<<5)|((DISPLAY[2]&0x02)<<4)|((DISPLAY[1]&0x02)<<3)|((DISPLAY[0]&0x02)<<2));
 				break;
-		case 2:	output_c(0b11111011);
-				output_a(((DISPLAY[4]&0x04)<<5)|((DISPLAY[3]&0x04)<<4)|((DISPLAY[2]&0x04)<<3)|((DISPLAY[1]&0x04)<<2)|((DISPLAY[0]&0x04)<<1));
+		case 2:	SEGMENT_C
+				output_a(((digit4Temp&0x04)<<5)|((DISPLAY[3]&0x04)<<4)|((DISPLAY[2]&0x04)<<3)|((DISPLAY[1]&0x04)<<2)|((DISPLAY[0]&0x04)<<1));
 				break;
-		case 3:	output_c(0b11110111);
+		case 3:	SEGMENT_D
 				output_a(((DISPLAY[3]&0x08)<<3)|((DISPLAY[2]&0x08)<<2)|((DISPLAY[1]&0x08)<<1)|(DISPLAY[0]&0x08));
 				break;
-		case 4:	output_c(0b11101111);
+		case 4:	SEGMENT_E
 				output_a(((DISPLAY[3]&0x10)<<2)|((DISPLAY[2]&0x10)<<1)|((DISPLAY[1]&0x10))|((DISPLAY[0]&0x10)>>1));
 				break;
-		case 5:	output_c(0b11011111);
+		case 5:	SEGMENT_F
 				output_a(((DISPLAY[3]&0x20)<<1)|((DISPLAY[2]&0x20))|((DISPLAY[1]&0x20)>>1)|((DISPLAY[0]&0x20)>>2));
 				break;
-		case 6:	output_c(0b10111111);
+		case 6:	SEGMENT_G
 				output_a(((DISPLAY[3]&0x40))|((DISPLAY[2]&0x40)>>1)|((DISPLAY[1]&0x40)>>2)|((DISPLAY[0]&0x40)>>3));
 				break;
-		case 7:	output_c(0b01111111);
+		case 7:	SEGMENT_DP
 				output_a((((DISPLAY[3]&0x80) _ADD_HEATER_STATUS)>>1)|(((DISPLAY[2]&0x80) _ADD_HEATER_2_STATUS)>>2)|((DISPLAY[1]&0x80)>>3)|((DISPLAY[0]&0x80)>>4));
 				break;
-		default:output_c(0b11111111);
+		default:SEGMENT_NONE
 				
 	}
 	
+	// Dim the display if on standby
 	CURRENT_SEG++;
-	if (CURRENT_SEG==8 && state!=ST_STANDBY)
+	if (CURRENT_SEG==8 && state!=ST_STANDBY) {
 		CURRENT_SEG=0;
+		degreeDimmer = !degreeDimmer;	// Toggle degreeDimmer bit at each multiplexing round
+	}	
 	if (CURRENT_SEG==16)
 		CURRENT_SEG=0;
 
@@ -342,6 +426,7 @@ void timer2isr(void) {
 	}	
 	oldenc = input_b();
 
+	// Encoder button readout
 	if (!input(PIN_E3)||(buttimer>0&&buttimer<72))	// 60 ms debounce on press
 		buttimer++;
 	else
@@ -360,7 +445,8 @@ void timer2isr(void) {
 	
 	menuMachine();	// menuMachine() call moved here to prevent missing events if interrupt happens during menuMachine call
 		
-	if (reed_status == REED_CLOSED && (state == ST_MAIN || state == ST_SETBACK))
+	// Count time when iron is on stand or heater duty cycles are below idle duty.
+	if ((heaterDuty < idleDuty && heater2Duty < idleDuty || reed_status == REED_CLOSED) && (state == ST_MAIN || state == ST_SETBACK))
 		milliseconds++;
 	else {
 		milliseconds=0;
@@ -372,24 +458,281 @@ void timer2isr(void) {
 		milliseconds=0;
 		if (idleminutes < 255)	// don't let idleminutes overflow
 			idleminutes++;
-//		if (idleminutes == setback_delay && setback_delay != 31)
-//			state = ST_SETBACK;
-//		if (idleminutes == poweroff_delay && poweroff_delay != 130)
-//			state = ST_STANDBY;		
 	}
 
+	// The time counted above is needed to determine when the setback or standby modes should be activated.
 	if (milliseconds == 1 && idleminutes == setback_delay && setback_delay != 31 && state == ST_MAIN)
 		state = ST_SETBACK;
 	if (milliseconds == 1 && idleminutes == poweroff_delay && poweroff_delay != 130 && (state == ST_MAIN || state == ST_SETBACK))
 		state = ST_STANDBY;		
 
-
+	// Setpointdelay means time setpoint is shown after adjusting, before display reverts back to show actual temperature
 	if (setpointdelay>0)
 		setpointdelay--;
 
+	// The setpoint is saved to EEPROM after the setpoint delay, to save EERPOM from wearing out
 	if (setpointdelay==1)
 		savesettings=1;
+	
+	// Calculate the average duty cycle driven to heaters
+	if (heaterStatus == 0x7f)
+		heaterCycles++;	
+
+	if (heater2Status == 0x7f)
+		heater2Cycles++;
+	
+	dutyCounter++;
+	if (dutyCounter == 800) {
+		dutyCounter = 0;
+		heaterDuty = heaterCycles>>3;
+		heater2Duty = heater2Cycles>>3;
+		heaterCycles = 0;
+		heater2Cycles = 0;
+	}	
+
 	// output_a(_SPACE); // to test interrupt length
+}
+
+void main()
+{
+	unsigned int16 temp_reading=0;
+	unsigned int32 right_sum=0;
+	unsigned int32 left_sum=0;
+	unsigned int32 right_sum_2=0;
+	unsigned int32 left_sum_2=0;
+	unsigned int16 kty_sum=0;
+	signed int16 kty_filtering_sum=0;
+	signed int16 signed_temp_reading=0;
+	unsigned int16 reed_sum=0;
+	unsigned int8 kty_cycles=0;
+	unsigned int8 kty_filt_cycles=0;
+	unsigned int1 calculateTemp=0;
+	unsigned int1 checkTip=0;
+	unsigned int8 paramsOutOfRange=0;
+	setup_timer_2(T2_DIV_BY_16,208,2); // set timer2 to 832 탎 (prescaler 16 and postscaler 2, period 208)
+	enable_interrupts(INT_TIMER2);
+	enable_interrupts(GLOBAL);
+	set_tris_a(0b00000111);
+	set_tris_b(0b11001111);
+	set_tris_c(0x00);
+	set_tris_e(0x11111000);
+	port_a_pullups(0b00000000);
+	port_b_pullups(0b11000000);
+	port_e_pullups(0b00001000);
+	output_low(HEATER_1);	// Heater 1 (right) off
+	output_low(HEATER_2);	// Heater 2 (left) off
+
+	DISPLAY[4]=_SPACE;
+		
+	setup_adc_ports( sAN0|sAN1|sAN2|sAN9|sAN12,VSS_FVR);	// AN9 = reed pullup
+	setup_vref(VREF_ON | VREF_ADC_2v048 | VREF_COMP_DAC_2v048);
+	// setup_opamp2(OPAMP_ENABLED | OPAMP_HIGH_GBWP_MODE | OPAMP_NI_TO_FVR);		// To enable KTY pullup
+	setup_opamp2(OPAMP_DISABLED);		// To disable KTY pullup
+	setup_dac(DAC_OFF);
+
+	setup_adc(ADC_CLOCK_DIV_32);	// Gives 1탎 conversion clock cycle time (fastest recommended)
+
+	setpoint = read_int16_eeprom(0);
+	setback = read_int16_eeprom(2);			// must use even addresses because one int16 takes two bytes
+	setback_delay = read_int16_eeprom(4);
+	poweroff_delay = read_int16_eeprom(6);
+	temperature_offset = read_int16_eeprom(8);
+	reference = read_int16_eeprom(10);
+	stepsize = read_int16_eeprom(12);
+	temperature_unit = read_eeprom(14);
+	poorMode = read_eeprom(15);
+	mainsFrequency = read_eeprom(16);
+	maxDuty = read_eeprom(17);
+	idleDuty = read_eeprom(18);
+
+	if (setpoint < MIN_SETPOINT || setpoint > MAX_SETPOINT)		// Ensure safe temperature setpoints in case of corrupt EEPROM data
+		paramsOutOfRange=TRUE;
+	if (setback < MIN_SETPOINT || setback > MAX_SETPOINT)
+		paramsOutOfRange=TRUE;
+	if (setback_delay < 0 || setback_delay > MAX_SETBACK_DELAY+1)
+		paramsOutOfRange=TRUE;
+	if (poweroff_delay < 0 || poweroff_delay > MAX_POWEROFF_DELAY+10)
+		paramsOutOfRange=TRUE;
+	if (temperature_offset < -(MAX_TEMPERATURE_OFFSET) || temperature_offset > MAX_TEMPERATURE_OFFSET)
+		paramsOutOfRange=TRUE;
+	if (reference < 2048 - MAX_REFERENCE_TOLERANCE || reference > 2048 + MAX_REFERENCE_TOLERANCE)
+		paramsOutOfRange=TRUE;
+	if (stepsize != 1 && stepsize != 5)
+		paramsOutOfRange=TRUE;
+	if (temperature_unit != DISP_C && temperature_unit != DISP_F)
+		paramsOutOfRange=TRUE;
+	if (mainsFrequency != 50 && mainsFrequency != 60)
+		paramsOutOfRange=TRUE;
+	if (maxDuty < MIN_MAXDUTY || maxDuty > MAX_MAXDUTY)
+		paramsOutOfRange=TRUE;
+	if (idleDuty > MAX_IDLEDUTY)
+		paramsOutOfRange=TRUE;
+	
+	if (paramsOutOfRange) {
+		setpoint = DEFAULT_SETPOINT;
+		setback = DEFAULT_SETBACK;
+		setback_delay = DEFAULT_SETBACK_DELAY;
+		poweroff_delay = DEFAULT_POWEROFF_DELAY;
+		temperature_offset = DEFAULT_TEMPERATURE_OFFSET;
+		reference = DEFAULT_REFERENCE;
+		stepsize = DEFAULT_STEPSIZE;
+		temperature_unit = DEFAULT_TEMPERATURE_UNIT;
+		poorMode = DEFAULT_POORMODE;
+		mainsFrequency = DEFAULT_MAINSFREQUENCY;
+		maxDuty = DEFAULT_MAXDUTY;
+		idleDuty = DEFAULT_IDLEDUTY;
+	}	
+
+	normal_setpoint = setpoint;
+
+	recognizeTypeInStand();
+	recognizeTypeInStand();
+	delay_ms(10);	// let auto-zero op-amps stabilize before tip type recognition
+	tiptype = TYPE_WMRP;
+	recognizeTypeInStand();
+
+	/* Infinite loop */
+	while(1)
+	{
+		output_low(HEATER_1);	// Heater 1 (right) off
+		output_low(HEATER_2);	// Heater 2 (left) off
+		heaterStatus = 0xff;
+		heater2Status = 0xff;
+		delay_us(10);
+
+		// READ REED STATUS - Reed pullup is on for 35 us (measured 21.1.2017 / FW 0.6)
+		setup_adc_ports( sAN0|sAN1|sAN2|sAN12,VSS_VDD);	// AN9 = reed pullup
+		set_tris_b(0b11000111);
+		output_high(REED_PULLUP);
+		set_adc_channel(12);
+		delay_us(5);
+		reed_sum = read_adc();		
+		output_low(REED_PULLUP);
+		set_tris_b(0b11001111);
+		setup_adc_ports( sAN0|sAN1|sAN2|sAN9|sAN12,VSS_FVR);	// AN9 = reed pullup
+
+		// KTY READOUT - KTY pullup is on for 34 us (measured 21.1.2017 / FW 0.6)
+		setup_opamp2(OPAMP_ENABLED | OPAMP_HIGH_GBWP_MODE | OPAMP_NI_TO_FVR);		// To enable KTY pullup
+		set_adc_channel(2);
+		delay_us(5);
+		kty_sum += read_adc();
+		if (state != ST_ADJ_REFERENCE)			// Keep KTY pullup on (reference on) when adjusting reference compensation
+			setup_opamp2(OPAMP_DISABLED);		// To disable KTY pullup
+
+		// delay_us(300);		// takes about 200-300 탎 for opamp output to stabilize after pullups turned off - delay not
+								// needed anymore because wait for mainsCycles below gives more than enough time.
+		
+		if (mainsFrequency==50)										// added 2*832us waiting to reduce heating duty cycle in FW 0.7
+			while (mainsCycles != maxDuty && mainsCycles != 12+maxDuty) {	}		// wait here for measurement cycle start (50 Hz)
+		else
+			while (mainsCycles != maxDuty && mainsCycles != 10+maxDuty) {	}		// wait here for measurement cycle start (60 Hz)
+
+		if (mainsCycles == maxDuty) {
+			readAdc(&left_sum, 1);	// this function should take about 0.3 ms (ADC_CLOCK_DIV32 @ 32 MHz)
+			readAdc(&right_sum, 0);
+		}
+		else {
+			readAdc(&left_sum_2, 1);
+			readAdc(&right_sum_2, 0);
+			calculateTemp = 1;
+		}
+
+		if (checkTip) {				// seems that new iron is connected with reed closed - lets check the type!
+			tiptype = TYPE_WMRP;	// defalut to WMRP
+			recognizeTypeInStand();	// check if it is WMRT
+			checkTip=0;
+		}	
+		
+		if (tiptype == TYPE_NC) {
+			right_buf=555;
+		}
+
+		if (right_buf<setpoint) {
+			heaterStatus = 0x7f;
+			output_high(HEATER_1);
+		}
+		else {
+			heaterStatus = 0xff;
+		}	
+
+		if (left_buf<setpoint && tiptype == TYPE_WMRT) {
+			heater2Status = 0x7f;
+			output_high(HEATER_2);
+		}
+		else {
+			heater2Status = 0xff;
+		}	
+
+		kty_cycles++;
+		if (kty_cycles==16) {
+			kty_lookup_16bit(&kty_sum, &signed_temp_reading);
+			kty_sum=0;
+			if (signed_temp_reading > 130)	// No KTY sensor or bad contact
+				signed_temp_reading=30;		// use some default value
+			kty_filtering_sum += signed_temp_reading;
+			kty_filt_cycles++;
+			if (kty_filt_cycles==16) {
+				kty_filt_cycles=0;
+				kty_buf = kty_filtering_sum / 16;
+				kty_filtering_sum=0;
+			}
+			kty_cycles=0;
+		}
+
+		if (calculateTemp==1) {				// takes about 1.5ms
+			left_sum = (left_sum + left_sum_2)/2;
+			right_sum = (right_sum + right_sum_2)/2;
+			tc_lookup_32bit(&left_sum, &left_buf);
+			tc_lookup_32bit(&right_sum, &right_buf);
+			calculateTemp=0;
+		}
+
+		if (savesettings && state == ST_MAIN)	// do not save setpoint if already gone to stby
+		{
+			write_int16_eeprom(0, setpoint);
+			savesettings=0;
+		}	
+		
+		// some filtering to displayed temperature to reduce flickering
+		temp_reading = filteredtemp*30;
+		temp_reading = temp_reading + right_buf*10;
+		filteredtemp = temp_reading / 40;
+
+		if ((filteredtemp-setpoint < 3) && (setpoint-filteredtemp < 3))
+			filteredtemp = setpoint;
+
+		if (reed_sum<312) {
+			if (poorMode) {
+				tiptype = TYPE_WMRP;
+				reed_status = REED_OPEN;
+			}
+			else if (tiptype == TYPE_NC) {
+				checkTip=1;
+				reed_status = REED_CLOSED;
+			}	
+			else
+				reed_status = REED_CLOSED;
+		}
+		else if (reed_sum>1798 && reed_sum<2298) {
+			tiptype = TYPE_WMRP;
+			reed_status = REED_OPEN;
+		}
+		else if (reed_sum>2481 && reed_sum<2981) {
+			tiptype = TYPE_WMRT;
+			reed_status = REED_OPEN;
+		}
+		else if (reed_sum>3750) {
+			tiptype = TYPE_NC;
+			reed_status = REED_OPEN;
+		}
+
+		updateDisplay();		// updateDisplay call takes about 520 탎 when in 'normal' mode (displaying temp)
+
+		if (mainsFrequency==50)
+			while (mainsCycles != 0 && mainsCycles != 12) {	}		// wait here for heating cycle to stop (50 Hz)
+		else
+			while (mainsCycles != 0 && mainsCycles != 10) {	}		// wait here for heating cycle to stop (60 Hz)
+	}	// end while
 }
 
 void show_7seg_num(DISP_MODES mode, signed int16 num)
@@ -520,6 +863,7 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 		case ST_STANDBY:
 			setpoint=0;
 			if (reed_status == REED_OPEN && prev_reed_status == REED_CLOSED)
+//			if (heaterDuty > idleDuty || heater2Duty > idleDuty || (reed_status == REED_OPEN && prev_reed_status == REED_CLOSED))
 				event = EVT_BUTTON;
 			prev_reed_status = reed_status;
 			switch(event)
@@ -539,8 +883,10 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 		case ST_SETBACK:
 			if (setback < setpoint)
 				setpoint = setback;
-			if (reed_status == REED_OPEN)
+//			if (reed_status == REED_OPEN && prev_reed_status == REED_CLOSED)
+			if ((idleDuty != 0 && (heaterDuty > idleDuty || heater2Duty > idleDuty)) || (reed_status == REED_OPEN && prev_reed_status == REED_CLOSED))
 				event = EVT_BUTTON;
+			prev_reed_status = reed_status;
 			switch(event)
 			{
 				case EVT_BUTTON:
@@ -914,7 +1260,7 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					state = ST_MENU_TC_1_READING;
 					break;
 				case EVT_RIGHT:
-					state = ST_MENU_POOR;
+					state = ST_MENU_PWM_1_READING;
 					break;
 			}
 			break;
@@ -926,6 +1272,112 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					break;
 			}
 			break;
+		case ST_MENU_PWM_1_READING:
+			switch(event)
+			{
+				case EVT_BUTTON:
+					state = ST_SHOW_PWM_1_READING;
+					break;
+				case EVT_LEFT:
+					state = ST_MENU_TC_2_READING;
+					break;
+				case EVT_RIGHT:
+					state = ST_MENU_PWM_2_READING;
+					break;
+			}
+			break;
+		case ST_SHOW_PWM_1_READING:
+			switch(event)
+			{
+				case EVT_BUTTON:
+					state = ST_MENU_PWM_1_READING;
+					break;
+			}
+			break;
+		case ST_MENU_PWM_2_READING:
+			switch(event)
+			{
+				case EVT_BUTTON:
+					state = ST_SHOW_PWM_2_READING;
+					break;
+				case EVT_LEFT:
+					state = ST_MENU_PWM_1_READING;
+					break;
+				case EVT_RIGHT:
+					state = ST_MENU_IDLE_DC;
+					break;
+			}
+			break;
+		case ST_SHOW_PWM_2_READING:
+			switch(event)
+			{
+				case EVT_BUTTON:
+					state = ST_MENU_PWM_2_READING;
+					break;
+			}
+			break;
+		case ST_MENU_IDLE_DC:
+			switch(event)
+			{
+				case EVT_BUTTON:
+					state = ST_ADJ_IDLE_DC;
+					break;
+				case EVT_LEFT:
+					state = ST_MENU_PWM_2_READING;
+					break;
+				case EVT_RIGHT:
+					state = ST_MENU_DC_LIMIT;
+					break;
+			}
+			break;
+		case ST_ADJ_IDLE_DC:
+			switch(event)
+			{
+				case EVT_BUTTON:
+					saveParms();
+					state = ST_MENU_IDLE_DC;
+					break;
+				case EVT_LEFT:
+					if(idleDuty>0)
+						idleDuty--;
+					break;
+				case EVT_RIGHT:
+					if(idleDuty < MAX_IDLEDUTY)
+						idleDuty++;
+				break;
+			}
+			break;
+		case ST_MENU_DC_LIMIT:
+			switch(event)
+			{
+				case EVT_BUTTON:
+					state = ST_ADJ_DC_LIMIT;
+					break;
+				case EVT_LEFT:
+					state = ST_MENU_IDLE_DC;
+					break;
+				case EVT_RIGHT:
+					state = ST_MENU_POOR;
+					break;
+			}
+			break;
+		case ST_ADJ_DC_LIMIT:
+			switch(event)
+			{
+				case EVT_BUTTON:
+					saveParms();
+					state = ST_MENU_DC_LIMIT;
+					break;
+				case EVT_LEFT:
+					if(maxDuty < MAX_MAXDUTY)
+						maxDuty++;
+					break;
+				case EVT_RIGHT:
+					if(maxDuty > MIN_MAXDUTY)
+						maxDuty--;
+				break;
+			}
+			break;
 		case ST_MENU_POOR:
 			switch(event)
 			{
@@ -933,7 +1385,7 @@ void menuMachine()		// Takes now 3..4us when display updates moved to separate f
 					state = ST_ADJ_POOR;
 					break;
 				case EVT_LEFT:
-					state = ST_MENU_TC_2_READING;
+					state = ST_MENU_DC_LIMIT;
 					break;
 				case EVT_RIGHT:
 					state = ST_MENU_FREQUENCY;
@@ -1025,7 +1477,10 @@ void updateDisplay()	// takes 520 us when showing iron temp, 400us when KTY temp
 			memcpy (DISPLAY, stby, sizeof (DISPLAY));
 			break;	
 		case ST_SETBACK:
-			show_7seg_num(temperature_unit, filteredtemp);
+			if (tiptype == TYPE_NC)
+				memcpy (DISPLAY, nc, sizeof (DISPLAY));
+			else
+				show_7seg_num(temperature_unit, filteredtemp);
 			break;	
 		case ST_MENU_MAIN:
 			memcpy (DISPLAY, bacc, sizeof (DISPLAY));
@@ -1133,6 +1588,37 @@ void updateDisplay()	// takes 520 us when showing iron temp, 400us when KTY temp
 		case ST_SHOW_TC_2_READING:
 			show_7seg_num(temperature_unit, left_buf);
 			break;
+		case ST_MENU_PWM_1_READING:
+			memcpy (DISPLAY, pwm1, sizeof (DISPLAY));
+			break;
+		case ST_SHOW_PWM_1_READING:
+			show_7seg_num(DISP_NUM, heaterDuty);
+			break;
+		case ST_MENU_PWM_2_READING:
+			memcpy (DISPLAY, pwm2, sizeof (DISPLAY));
+			break;
+		case ST_SHOW_PWM_2_READING:
+			show_7seg_num(DISP_NUM, heater2Duty);
+			break;
+		case ST_MENU_IDLE_DC:
+			memcpy (DISPLAY, idle, sizeof (DISPLAY));
+			break;
+		case ST_ADJ_IDLE_DC:
+			if (idleDuty == 0)
+				memcpy (DISPLAY, off, sizeof (DISPLAY));
+			else
+				show_7seg_num(DISP_NUM, idleDuty);
+			break;
+		case ST_MENU_DC_LIMIT:
+			memcpy (DISPLAY, dcli, sizeof (DISPLAY));
+			break;
+		case ST_ADJ_DC_LIMIT:
+			if (mainsFrequency == 50)
+//				show_7seg_num(DISP_NUM, 100-maxDuty*8);		// approximation with int8 arithmetics
+				show_7seg_num(DISP_NUM, (1200-(unsigned int16)(maxDuty)*100)/12);
+			else
+				show_7seg_num(DISP_NUM, 100-maxDuty*10);
+			break;
 		case ST_MENU_POOR:
 			memcpy (DISPLAY, poor, sizeof (DISPLAY));
 			break;
@@ -1190,237 +1676,6 @@ void saveParms()
 	write_eeprom(14, temperature_unit);
 	write_eeprom(15, poorMode);
 	write_eeprom(16, mainsFrequency);
+	write_eeprom(17, maxDuty);
+	write_eeprom(18, idleDuty);
 }	
-
-
-void main()
-{
-	unsigned int16 temp_reading=0;
-	unsigned int32 right_sum=0;
-	unsigned int32 left_sum=0;
-	unsigned int32 right_sum_2=0;
-	unsigned int32 left_sum_2=0;
-	unsigned int16 kty_sum=0;
-	signed int16 kty_filtering_sum=0;
-	signed int16 signed_temp_reading=0;
-	unsigned int16 reed_sum=0;
-	unsigned int8 kty_cycles=0;
-	unsigned int8 kty_filt_cycles=0;
-	unsigned int1 calculateTemp=0;
-	unsigned int1 checkTip=0;
-	unsigned int8 paramsOutOfRange=0;
-	setup_timer_2(T2_DIV_BY_16,208,2); // set timer2 to 832 탎 (prescaler 16 and postscaler 2, period 208)
-	enable_interrupts(INT_TIMER2);
-	enable_interrupts(GLOBAL);
-	set_tris_a(0b00000111);
-	set_tris_b(0b11001111);
-	set_tris_c(0x00);
-	set_tris_e(0x11111000);
-	port_a_pullups(0b00000000);
-	port_b_pullups(0b11000000);
-	port_e_pullups(0b00001000);
-	output_low(HEATER_1);	// Heater 1 (right) off
-	output_low(HEATER_2);	// Heater 2 (left) off
-
-	DISPLAY[4]=_SPACE;
-		
-	setup_adc_ports( sAN0|sAN1|sAN2|sAN9|sAN12,VSS_FVR);	// AN9 = reed pullup
-	setup_vref(VREF_ON | VREF_ADC_2v048 | VREF_COMP_DAC_2v048);
-	// setup_opamp2(OPAMP_ENABLED | OPAMP_HIGH_GBWP_MODE | OPAMP_NI_TO_FVR);		// To enable KTY pullup
-	setup_opamp2(OPAMP_DISABLED);		// To disable KTY pullup
-	setup_dac(DAC_OFF);
-
-	setup_adc(ADC_CLOCK_DIV_32);	// Gives 1탎 conversion clock cycle time (fastest recommended)
-
-	setpoint = read_int16_eeprom(0);
-	setback = read_int16_eeprom(2);			// must use even addresses because one int16 takes two bytes
-	setback_delay = read_int16_eeprom(4);
-	poweroff_delay = read_int16_eeprom(6);
-	temperature_offset = read_int16_eeprom(8);
-	reference = read_int16_eeprom(10);
-	stepsize = read_int16_eeprom(12);
-	temperature_unit = read_eeprom(14);
-	poorMode = read_eeprom(15);
-	mainsFrequency = read_eeprom(16);
-
-	if (setpoint < MIN_SETPOINT || setpoint > MAX_SETPOINT)		// Ensure safe temperature setpoints in case of corrupt EEPROM data
-		paramsOutOfRange=TRUE;
-	if (setback < MIN_SETPOINT || setback > MAX_SETPOINT)
-		paramsOutOfRange=TRUE;
-	if (setback_delay < 0 || setback_delay > MAX_SETBACK_DELAY+1)
-		paramsOutOfRange=TRUE;
-	if (poweroff_delay < 0 || poweroff_delay > MAX_POWEROFF_DELAY+10)
-		paramsOutOfRange=TRUE;
-	if (temperature_offset < -(MAX_TEMPERATURE_OFFSET) || temperature_offset > MAX_TEMPERATURE_OFFSET)
-		paramsOutOfRange=TRUE;
-	if (reference < 2048 - MAX_REFERENCE_TOLERANCE || reference > 2048 + MAX_REFERENCE_TOLERANCE)
-		paramsOutOfRange=TRUE;
-	if (stepsize != 1 && stepsize != 5)
-		paramsOutOfRange=TRUE;
-	if (temperature_unit != DISP_C && temperature_unit != DISP_F)
-		paramsOutOfRange=TRUE;
-	if (mainsFrequency != 50 && mainsFrequency != 60)
-		paramsOutOfRange=TRUE;
-	
-	if (paramsOutOfRange) {
-		setpoint = DEFAULT_SETPOINT;
-		setback = DEFAULT_SETBACK;
-		setback_delay = DEFAULT_SETBACK_DELAY;
-		poweroff_delay = DEFAULT_POWEROFF_DELAY;
-		temperature_offset = DEFAULT_TEMPERATURE_OFFSET;
-		reference = DEFAULT_REFERENCE;
-		stepsize = DEFAULT_STEPSIZE;
-		temperature_unit = DEFAULT_TEMPERATURE_UNIT;
-		poorMode = DEFAULT_POORMODE;
-		mainsFrequency = DEFAULT_MAINSFREQUENCY;
-	}	
-
-	normal_setpoint = setpoint;
-
-	recognizeTypeInStand();
-	recognizeTypeInStand();
-	delay_ms(10);	// let auto-zero op-amps stabilize before tip type recognition
-	tiptype = TYPE_WMRP;
-	recognizeTypeInStand();
-
-	/* Infinite loop */
-	while(1)
-	{
-		output_low(HEATER_1);	// Heater 1 (right) off
-		output_low(HEATER_2);	// Heater 2 (left) off
-		delay_us(10);
-
-		// READ REED STATUS - Reed pullup is on for 35 us (measured 21.1.2017 / FW 0.6)
-		setup_adc_ports( sAN0|sAN1|sAN2|sAN12,VSS_VDD);	// AN9 = reed pullup
-		set_tris_b(0b11000111);
-		output_high(REED_PULLUP);
-		set_adc_channel(12);
-		delay_us(5);
-		reed_sum = read_adc();		
-		output_low(REED_PULLUP);
-		set_tris_b(0b11001111);
-		setup_adc_ports( sAN0|sAN1|sAN2|sAN9|sAN12,VSS_FVR);	// AN9 = reed pullup
-
-		// KTY READOUT - KTY pullup is on for 34 us (measured 21.1.2017 / FW 0.6)
-		setup_opamp2(OPAMP_ENABLED | OPAMP_HIGH_GBWP_MODE | OPAMP_NI_TO_FVR);		// To enable KTY pullup
-		set_adc_channel(2);
-		delay_us(5);
-		kty_sum += read_adc();
-		if (state != ST_ADJ_REFERENCE)			// Keep KTY pullup on (reference on) when adjusting reference compensation
-			setup_opamp2(OPAMP_DISABLED);		// To disable KTY pullup
-
-		// delay_us(300);		// takes about 200-300 탎 for opamp output to stabilize after pullups turned off - delay not
-								// needed anymore because wait for mainsCycles below gives more than enough time.
-		
-		if (mainsFrequency==50)										// added 2*832us waiting to reduce heating duty cycle in FW 0.7
-			while (mainsCycles != 3 && mainsCycles != 15) {	}		// wait here for measurement cycle start (50 Hz)
-		else
-			while (mainsCycles != 3 && mainsCycles != 13) {	}		// wait here for measurement cycle start (60 Hz)
-
-		if (mainsCycles == 3) {
-			readAdc(&left_sum, 1);	// this function should take about 0.3 ms (ADC_CLOCK_DIV32 @ 32 MHz)
-			readAdc(&right_sum, 0);
-		}
-		else {
-			readAdc(&left_sum_2, 1);
-			readAdc(&right_sum_2, 0);
-			calculateTemp = 1;
-		}
-
-		if (checkTip) {				// seems that new iron is connected with reed closed - lets check the type!
-			tiptype = TYPE_WMRP;	// defalut to WMRP
-			recognizeTypeInStand();	// check if it is WMRT
-			checkTip=0;
-		}	
-		
-		if (tiptype == TYPE_NC) {
-			right_buf=555;
-		}
-
-		if (right_buf<setpoint) {
-			heaterStatus = 0x7f;
-			output_high(HEATER_1);
-		}
-		else {
-			heaterStatus = 0xff;
-		}	
-
-		if (left_buf<setpoint && tiptype == TYPE_WMRT) {
-			heater2Status = 0x7f;
-			output_high(HEATER_2);
-		}
-		else {
-			heater2Status = 0xff;
-		}	
-
-		kty_cycles++;
-		if (kty_cycles==16) {
-			kty_lookup_16bit(&kty_sum, &signed_temp_reading);
-			kty_sum=0;
-			if (signed_temp_reading > 130)	// No KTY sensor or bad contact
-				signed_temp_reading=30;		// use some default value
-			kty_filtering_sum += signed_temp_reading;
-			kty_filt_cycles++;
-			if (kty_filt_cycles==16) {
-				kty_filt_cycles=0;
-				kty_buf = kty_filtering_sum / 16;
-				kty_filtering_sum=0;
-			}
-			kty_cycles=0;
-		}
-
-		if (calculateTemp==1) {				// takes about 1.5ms
-			left_sum = (left_sum + left_sum_2)/2;
-			right_sum = (right_sum + right_sum_2)/2;
-			tc_lookup_32bit(&left_sum, &left_buf);
-			tc_lookup_32bit(&right_sum, &right_buf);
-			calculateTemp=0;
-		}
-
-		if (savesettings && state == ST_MAIN)	// do not save setpoint if already gone to stby
-		{
-			write_int16_eeprom(0, setpoint);
-			savesettings=0;
-		}	
-		
-		// some filtering to displayed temperature to reduce flickering
-		temp_reading = filteredtemp*30;
-		temp_reading = temp_reading + right_buf*10;
-		filteredtemp = temp_reading / 40;
-
-		if ((filteredtemp-setpoint < 3) && (setpoint-filteredtemp < 3))
-			filteredtemp = setpoint;
-
-		if (reed_sum<312) {
-			if (poorMode) {
-				tiptype = TYPE_WMRP;
-				reed_status = REED_OPEN;
-			}
-			else if (tiptype == TYPE_NC) {
-				checkTip=1;
-				reed_status = REED_CLOSED;
-			}	
-			else
-				reed_status = REED_CLOSED;
-		}
-		else if (reed_sum>1798 && reed_sum<2298) {
-			tiptype = TYPE_WMRP;
-			reed_status = REED_OPEN;
-		}
-		else if (reed_sum>2481 && reed_sum<2981) {
-			tiptype = TYPE_WMRT;
-			reed_status = REED_OPEN;
-		}
-		else if (reed_sum>3750) {
-			tiptype = TYPE_NC;
-			reed_status = REED_OPEN;
-		}
-
-		updateDisplay();		// updateDisplay call takes about 520 탎 when in 'normal' mode (displaying temp)
-
-		if (mainsFrequency==50)
-			while (mainsCycles != 0 && mainsCycles != 12) {	}		// wait here for heating cycle to stop (50 Hz)
-		else
-			while (mainsCycles != 0 && mainsCycles != 10) {	}		// wait here for heating cycle to stop (60 Hz)
-	}	// end while
-}
