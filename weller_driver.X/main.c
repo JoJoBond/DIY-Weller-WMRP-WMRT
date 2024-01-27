@@ -1,4 +1,4 @@
-#define FW_VERSION 920
+#define FW_VERSION 921
 // #define WELLER_CC_DISPLAY	// Uncomment this line if you use common cathode display
 // #define BUZZ_MOD             // Uncomment this line if you applied the buzzer mod
 // #define DEBUG                // Uncomment to enable some debugging functions
@@ -292,12 +292,13 @@ volatile __bit SaveAllSettings = 0;
 volatile __bit SaveSetpoint = 0;
 #ifdef BUZZ_MOD
 volatile uint_fast16_t BuzzerCycles = 0;
+volatile __bit WaitingForTemperature = 0;
 #endif
 
 void showSevenSegNum(DISP_MODES mode, int_fast32_t num); // converts integers to 7 segment numbers
-inline void readAdc(int_fast32_t* adc, uint_fast8_t channel); // reads specified ADC input 16 times to get a virtual 16 bit reading
-int_fast16_t tcLookup(int_fast32_t* adcSum); // converts thermocouple voltage to temperature
-int_fast16_t ktyLookup(int_fast32_t* adcSum); // converts cold junction compensation sensor voltage to temperature
+inline int_fast32_t readAdc(uint_fast8_t channel); // reads specified ADC input 16 times to get a virtual 16 bit reading
+int_fast16_t tcLookup(int_fast32_t adcSum); // converts thermocouple voltage to temperature
+int_fast16_t ktyLookup(int_fast32_t adcSum); // converts cold junction compensation sensor voltage to temperature
 inline void menuMachine(void); // updates menu state based on encoder event
 inline void updateDisplay(void); // updates display memory based on current menu state
 void recognizeTypeInStand(void); // recognizes tip type even when in stand
@@ -503,9 +504,6 @@ void main(void) {
     static __bit CalculateTemperature = 0;
     static __bit ReadTip = 0;
     static __bit AdcReadSwitch = 0;
-#ifdef BUZZ_MOD
-    static __bit WaitingForTemperature = 0;
-#endif
 
     init();
 
@@ -630,16 +628,13 @@ void main(void) {
         // wait here for measurement cycle start
         while(!DutyCycleOn);
         
-        readAdc(&AdcSumL, 1);
-        readAdc(&AdcSumR, 0);
-        
         if (!AdcReadSwitch) {
-            readAdc(&AdcSumL, 1); // this function should take about 0.3 ms (ADC_CLOCK_DIV32 @ 32 MHz)
-            readAdc(&AdcSumR, 0);
+            AdcSumL = readAdc(1); // this function should take about 0.3 ms (ADC_CLOCK_DIV32 @ 32 MHz)
+            AdcSumR = readAdc(0);
             AdcReadSwitch = 1;
         } else {
-            readAdc(&AdcSumL2, 1);
-            readAdc(&AdcSumR2, 0);
+            AdcSumL2 = readAdc(1);
+            AdcSumR2 = readAdc(0);
             AdcReadSwitch = 0;
             CalculateTemperature = 1;
         }
@@ -668,7 +663,7 @@ void main(void) {
 
         KtyCycles++;
         if (KtyCycles == 16) {
-            KtyReading = ktyLookup(&KtySum);
+            KtyReading = ktyLookup(KtySum);
             KtySum = 0;
             if (KtyReading > 130) // No KTY sensor or bad contact
                 KtyReading = 30; // use some default value
@@ -685,8 +680,8 @@ void main(void) {
         if (CalculateTemperature) { // takes about 1.5ms
             AdcSumL = (AdcSumL + AdcSumL2) / 2;
             AdcSumR = (AdcSumR + AdcSumR2) / 2;
-            HeaterTemperatureL = tcLookup(&AdcSumL);
-            HeaterTemperatureR = tcLookup(&AdcSumR);
+            HeaterTemperatureL = tcLookup(AdcSumL);
+            HeaterTemperatureR = tcLookup(AdcSumR);
             CalculateTemperature = 0;
         }
 
@@ -717,7 +712,7 @@ void main(void) {
         }
         
         // If temperature is within 3 degrees from target, just show target temperature
-        if ((DisplayTemperature - ActiveSetpoint < 3) && (ActiveSetpoint - DisplayTemperature < 3)) {
+        if ((DisplayTemperature - ActiveSetpoint < 3) && (DisplayTemperature - ActiveSetpoint > -3)) {
             DisplayTemperature = ActiveSetpoint;
             
 #ifdef BUZZ_MOD
@@ -730,7 +725,7 @@ void main(void) {
         }
 #ifdef BUZZ_MOD 
         else {
-            if (SetpointDelay > 0 && SetpointDelay <= 600)
+            if (State == ST_MAIN && (SetpointDelay > 0 && SetpointDelay <= 600))
                 WaitingForTemperature = 1;
         }
 
@@ -825,7 +820,7 @@ void showSevenSegNum(DISP_MODES mode, int_fast32_t num) {
     }
 }
 
-inline void readAdc(int_fast32_t* adc, uint_fast8_t channel) {
+inline int_fast32_t readAdc(uint_fast8_t channel) {
     static int_fast32_t adcSum = 0;
     static int_fast8_t i = 0;
     
@@ -842,7 +837,7 @@ inline void readAdc(int_fast32_t* adc, uint_fast8_t channel) {
         adcSum += ((((int_fast16_t)ADRESH) << 8) | (int_fast16_t)ADRESL);
     }
 
-    *adc = adcSum;
+    return adcSum;
 }
 
 // <editor-fold defaultstate="collapsed" desc="Lookups">
@@ -856,37 +851,36 @@ int_fast32_t alempi = 0;
 int_fast8_t j = 0;
 #endif
 
-int_fast16_t tcLookup(int_fast32_t* adcSum) {
-    static int_fast32_t sum32 = 0;
-    // sum32 = (uint_fast32_t)*adcSum * (uint_fast32_t)reference / 2048;	// compensate for reference inaccuracy
-    sum32 = (*adcSum * Reference) / 2048; // compensate for reference inaccuracy
+int_fast16_t tcLookup(int_fast32_t adcSum) {
+    // adcSum = adcSum * (uint_fast32_t)reference / 2048;	// compensate for reference inaccuracy
+    adcSum = (adcSum * Reference) / 2048; // compensate for reference inaccuracy
 #ifndef POLY_LOOKUP
     for (j = 0; j < 50; j++) {
-        if (sum32 < TcLookupData[j])
+        if (adcSum < TcLookupData[j])
             break;
     }
     ylempi = TcLookupData[j];
     alempi = TcLookupData[j - 1];
-    temp1 = 10 * (alempi - sum32);
+    temp1 = 10 * (alempi - adcSum);
     temp2 = (alempi - ylempi);
 
     return ((int_fast16_t) (temp1 / temp2 + 10 * (j - 1))) + KtyTemperature - TemperatureOffset; // -1 because tc starts from zero. subtract offset setting
 #else
-    if (sum32 <= 0) {
+    if (adcSum <= 0) {
         temp1 = 0;
-    } else if (sum32 > 65535) {
+    } else if (adcSum > 65535) {
         temp1 = 525;
     } else {
         // Polynomial of 3rd degree. Result calculated with Horner method.
         // Fewer multiplications and better control over number ranges
         
-        temp1 = (TC_POLY_COEFF_3 * sum32) + TC_POLY_COEFF_2;
+        temp1 = (TC_POLY_COEFF_3 * adcSum) + TC_POLY_COEFF_2;
         temp1 = ((temp1 - 5000) / 10000); // division by 10000 with rounding, number is always negative
-        temp1 = temp1 * sum32;
+        temp1 = temp1 * adcSum;
         temp1 = ((temp1 - 5) / 10); // division by 10 with rounding, number is always negative
         temp1 = temp1 + TC_POLY_COEFF_1;
         temp1 = ((temp1 + 50000) / 100000); // division by 100000 with rounding, number is always positive
-        temp1 = (temp1 * sum32) + TC_POLY_COEFF_0;
+        temp1 = (temp1 * adcSum) + TC_POLY_COEFF_0;
         temp1 = ((temp1 + 500000) / 1000000); // division by 1000000 with rounding, number is always positive
     }
 
@@ -894,34 +888,34 @@ int_fast16_t tcLookup(int_fast32_t* adcSum) {
 #endif
 }
 
-int_fast16_t ktyLookup(int_fast32_t* adcSum) {
+int_fast16_t ktyLookup(int_fast32_t adcSum) {
 #ifndef POLY_LOOKUP
     for (j = 0; j < 21; j++) {
-        if (*adcSum < KtyLookupData[j])
+        if (adcSum < KtyLookupData[j])
             break;
     }
 
     ylempi = KtyLookupData[j];
     alempi = KtyLookupData[j - 1];
-    temp1 = 10 * (alempi - *adcSum);
+    temp1 = 10 * (alempi - adcSum);
     temp2 = (alempi - ylempi);
     return (int_fast16_t) (temp1 / temp2 + 10 * (j - 6)); // -6 because kty_lookup begins from -50
 #else
-    if ((*adcSum) > 43800)
+    if (adcSum > 43800)
         return 155;
-    else if ((*adcSum) < 19800)
+    else if (adcSum < 19800)
         return -60;
 
     // Polynomial of 4th degree. Result calculated with Horner method.
     // Fewer multiplications and better control over number ranges
 
-    temp1 = (KTY_POLY_COEFF_4 * *adcSum) + KTY_POLY_COEFF_3;
+    temp1 = (KTY_POLY_COEFF_4 * adcSum) + KTY_POLY_COEFF_3;
     temp1 = ((temp1 - 5000) / 10000); // division by 10000 with rounding, number is always negative
-    temp1 = (temp1 * *adcSum) + KTY_POLY_COEFF_2;
+    temp1 = (temp1 * adcSum) + KTY_POLY_COEFF_2;
     temp1 = ((temp1 + 50000) / 100000); // division by 100000 with rounding, number is always positive
-    temp1 = (temp1 * *adcSum) + KTY_POLY_COEFF_1;
+    temp1 = (temp1 * adcSum) + KTY_POLY_COEFF_1;
     temp1 = ((temp1 - (temp1 > 0 ? 5000 : -5000)) / 10000); // division by 10000 with rounding, number can be positive or negative
-    temp1 = (temp1 * *adcSum) + KTY_POLY_COEFF_0;
+    temp1 = (temp1 * adcSum) + KTY_POLY_COEFF_0;
     temp1 = ((temp1 - (temp1 > 0 ? 500000 : -500000)) / 1000000); // division by 1000000 with rounding, number can be positive or negative
 
     return (int_fast16_t) temp1;
@@ -1108,6 +1102,11 @@ inline void menuMachine(void) // Takes now 3..4us when display updates moved to 
             State = ST_MENU_COLD_COMPENSATION + (State - ST_SHOW_COLD_COMPENSATION);
         } else if (State == ST_MENU_MAIN) {
             State = ST_MAIN;
+#ifdef BUZZ_MOD
+            if((DisplayTemperature - ActiveSetpoint < 3) && (DisplayTemperature - ActiveSetpoint > -3)) {
+                WaitingForTemperature = 1;
+            }
+#endif
         } else if (State == ST_MAIN) {
             State = ST_STANDBY;
         } else if (State == ST_STANDBY || State == ST_SETBACK) {
@@ -1117,6 +1116,11 @@ inline void menuMachine(void) // Takes now 3..4us when display updates moved to 
             IdleMinutes = 0;
             if (State == ST_SETBACK && SetbackDelay == 0) // workaround to briefly activate ST_MAIN if setback is zero
                 IdleMilliseconds = 4294961286; // this number will overflow in 5 seconds
+#ifdef BUZZ_MOD
+            if((DisplayTemperature - ActiveSetpoint < 3) && (DisplayTemperature - ActiveSetpoint > -3)) {
+                WaitingForTemperature = 1;
+            }
+#endif
         }
 
         // </editor-fold>

@@ -2,5 +2,6 @@
 **/debug
 **/queuelogs
 **/dist
-**/nbproject/private/Makefile-local-default.mk
-**/nbproject/private/Makefile-genesis.properties
+**/nbproject/private
+**/nbproject/Makefile-local-default.mk
+**/nbproject/Makefile-genesis.properties
