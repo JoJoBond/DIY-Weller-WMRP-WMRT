@@ -1103,7 +1103,7 @@ inline void menuMachine(void) // Takes now 3..4us when display updates moved to 
         } else if (State == ST_MENU_MAIN) {
             State = ST_MAIN;
 #ifdef BUZZ_MOD
-            if((DisplayTemperature - ActiveSetpoint < 3) && (DisplayTemperature - ActiveSetpoint > -3)) {
+            if((DisplayTemperature - ActiveSetpoint >= 3) || (DisplayTemperature - ActiveSetpoint <= -3)) {
                 WaitingForTemperature = 1;
             }
 #endif
@@ -1117,7 +1117,7 @@ inline void menuMachine(void) // Takes now 3..4us when display updates moved to 
             if (State == ST_SETBACK && SetbackDelay == 0) // workaround to briefly activate ST_MAIN if setback is zero
                 IdleMilliseconds = 4294961286; // this number will overflow in 5 seconds
 #ifdef BUZZ_MOD
-            if((DisplayTemperature - ActiveSetpoint < 3) && (DisplayTemperature - ActiveSetpoint > -3)) {
+            if((DisplayTemperature - ActiveSetpoint >= 3) || (DisplayTemperature - ActiveSetpoint <= -3)) {
                 WaitingForTemperature = 1;
             }
 #endif
